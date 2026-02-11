@@ -1,0 +1,50 @@
+[project]
+name = "anticipation-mcp"
+version = "0.1.0"
+description = "Anticipatory Autoregressive Models with MCP support"
+readme = "README.md"
+requires-python = ">=3.10"
+# 保持你已经写好的依赖
+dependencies = [
+    "matplotlib == 3.7.1",
+    "midi2audio == 0.1.1",
+    "mido == 1.2.10",
+    "numpy == 1.22.4",
+    "transformers == 4.29.2",
+    "tqdm == 4.65.0",
+    "mcp >= 1.0.0",
+    "gradio[mcp]>=6.5.1",
+]
+
+[project.optional-dependencies]
+torch-cpu = ["torch"]
+torch-cuda128 = ["torch"]
+
+# 关键：告诉构建工具包含 anticipation 文件夹
+[tool.hatch.build.targets.wheel]
+packages = ["anticipation"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.2.0",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu128", marker = "extra == 'torch-cuda128'" },
+  { index = "pytorch-cpu", marker = "extra == 'torch-cpu' and extra != 'torch-cuda128'" },
+]
