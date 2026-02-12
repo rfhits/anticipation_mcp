@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime
+import json
 from pathlib import Path
 
 import gradio as gr
@@ -10,9 +11,10 @@ import torch
 from transformers import AutoModelForCausalLM
 
 from anticipation import ops
-from anticipation.config import MAX_TIME_IN_SECONDS
+from anticipation.config import MAX_TIME_IN_SECONDS, TIME_RESOLUTION
 from anticipation.convert import events_to_midi, midi_to_events
 from anticipation.sample import generate
+from anticipation.vocab import CONTROL_OFFSET, DUR_OFFSET, TIME_OFFSET
 
 
 _MODEL = None
@@ -79,6 +81,58 @@ def _apply_tempo_and_tpb(mid: mido.MidiFile, tempo_us: int, tpb: int) -> mido.Mi
             out_track.append(msg.copy(time=new_time))
         out.tracks.append(out_track)
     return out
+
+
+def _clear_region_events(events: list[int], start_s: float, end_s: float) -> list[int]:
+    # events are [time, duration, note] tokens with TIME_OFFSET/DUR_OFFSET applied.
+    # time/duration are in ticks at TIME_RESOLUTION (100 ticks/s = 10ms).
+    start_ticks = int(round(TIME_RESOLUTION * start_s))
+    end_ticks = int(round(TIME_RESOLUTION * end_s))
+    out: list[int] = []
+    for time, dur, note in zip(events[0::3], events[1::3], events[2::3]):
+        t = time - TIME_OFFSET
+        d = dur - DUR_OFFSET
+        # Truncate notes that cross into the cleared region.
+        if t < start_ticks and t + d > start_ticks:
+            d = start_ticks - t
+            if d <= 0:
+                continue
+        # Drop note onsets inside the cleared region.
+        if start_ticks <= t < end_ticks:
+            continue
+        out.extend([TIME_OFFSET + t, DUR_OFFSET + d, note])
+    return out
+
+
+def _rebase_to_zero(events: list[int]) -> list[int]:
+    if not events:
+        return []
+    offset_ticks = ops.min_time(events, seconds=False)
+    return ops.translate(events, -offset_ticks, seconds=False)
+
+
+def _plan_inpaint_window(
+    total_len_s: float,
+    start_s: float,
+    end_s: float,
+    max_window_s: float,
+) -> tuple[float, float]:
+    if total_len_s <= max_window_s:
+        return 0.0, total_len_s
+
+    window_len = max_window_s
+    center = (start_s + end_s) / 2.0
+    window_start = center - window_len / 2.0
+    window_end = window_start + window_len
+
+    if window_start < 0:
+        window_start = 0.0
+        window_end = window_len
+    if window_end > total_len_s:
+        window_end = total_len_s
+        window_start = window_end - window_len
+
+    return window_start, window_end
 
 
 def _build_prompt_window(events: list[int], max_s: float = 10.0) -> tuple[list[int], float, float]:
@@ -168,8 +222,115 @@ def continue_midi(
     return "\n".join(outputs)
 
 
-def _build_app() -> gr.Interface:
-    return gr.Interface(
+def inpaint_midi(
+    midi_path: str,
+    start_s: float,
+    end_s: float,
+    n_samples: int,
+    output_dir: str,
+    prompt_window_s: float,
+) -> str:
+    if not midi_path or not isinstance(midi_path, str):
+        raise ValueError("midi_path must be a local file path string")
+    if start_s is None or end_s is None or float(end_s) <= float(start_s):
+        raise ValueError("end_s must be > start_s")
+    if n_samples is None or int(n_samples) <= 0:
+        raise ValueError("n_samples must be >= 1")
+    if not output_dir:
+        raise ValueError("output_dir is required")
+    if prompt_window_s is None or float(prompt_window_s) <= 0:
+        raise ValueError("prompt_window_s must be > 0")
+
+    model = _load_model()
+    top_p = _top_p()
+
+    events = midi_to_events(midi_path)
+    tempo_us, tpb = _extract_tempo_and_tpb(midi_path)
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    total_len_s = ops.max_time(events, seconds=True)
+    if float(end_s) > total_len_s:
+        raise ValueError("end_s exceeds MIDI length")
+
+    max_window_s = min(float(prompt_window_s), float(MAX_TIME_IN_SECONDS))
+    if (float(end_s) - float(start_s)) > max_window_s:
+        raise ValueError("mask length exceeds max window")
+
+    window_start_s, window_end_s = _plan_inpaint_window(
+        total_len_s=total_len_s,
+        start_s=float(start_s),
+        end_s=float(end_s),
+        max_window_s=max_window_s,
+    )
+    local_start_s = float(start_s) - window_start_s
+    local_end_s = float(end_s) - window_start_s
+
+    window_events = ops.clip(
+        events,
+        window_start_s,
+        window_end_s,
+        clip_duration=False,
+        seconds=True,
+    )
+    window_events = _rebase_to_zero(window_events)
+
+    history = ops.clip(window_events, 0, local_start_s, clip_duration=False, seconds=True)
+    future = ops.clip(
+        window_events,
+        local_end_s,
+        window_end_s - window_start_s,
+        clip_duration=False,
+        seconds=True,
+    )
+    anticipated = [CONTROL_OFFSET + tok for tok in future]
+
+    cleared = _clear_region_events(events, float(start_s), float(end_s))
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    stem = Path(midi_path).stem
+
+    outputs: list[dict[str, str]] = []
+    for sample_idx in range(int(n_samples)):
+        inpainted = generate(
+            model,
+            local_start_s,
+            local_end_s,
+            inputs=history,
+            controls=anticipated,
+            top_p=top_p,
+            progress=False,
+        )
+        completed_local = ops.sort(inpainted + future)
+        inpaint_region = ops.clip(
+            completed_local,
+            local_start_s,
+            local_end_s,
+            clip_duration=False,
+            seconds=True,
+        )
+        inpaint_region = ops.translate(inpaint_region, window_start_s, seconds=True)
+        full_events = ops.sort(cleared + inpaint_region)
+
+        full_path = output_path / f"{stem}_inpaint_full_{timestamp}_{sample_idx}.mid"
+        part_path = output_path / f"{stem}_inpaint_part_{timestamp}_{sample_idx}.mid"
+
+        full_mid = events_to_midi(full_events)
+        full_mid = _apply_tempo_and_tpb(full_mid, tempo_us, tpb)
+        full_mid.save(str(full_path))
+
+        part_events = _rebase_to_zero(inpaint_region)
+        part_mid = events_to_midi(part_events)
+        part_mid = _apply_tempo_and_tpb(part_mid, tempo_us, tpb)
+        part_mid.save(str(part_path))
+
+        outputs.append({"full": str(full_path), "part": str(part_path)})
+
+    return json.dumps(outputs, ensure_ascii=False)
+
+
+def _build_app() -> gr.TabbedInterface:
+    continue_iface = gr.Interface(
         fn=continue_midi,
         inputs=[
             gr.Textbox(label="MIDI Path", placeholder="C:/path/to/input.mid"),
@@ -181,6 +342,21 @@ def _build_app() -> gr.Interface:
         outputs=gr.Textbox(label="Output Paths (one per line)"),
         title="Anticipatory Continue",
         description="Provide a MIDI path and generate continuations using fixed 5s steps.",
+    )
+
+    inpaint_iface = gr.Interface(
+        fn=inpaint_midi,
+        inputs=[
+            gr.Textbox(label="MIDI Path", placeholder="C:/path/to/input.mid"),
+            gr.Number(label="Inpaint Start (s)", value=0.0),
+            gr.Number(label="Inpaint End (s)", value=5.0),
+            gr.Number(label="Samples", value=1, precision=0),
+            gr.Textbox(label="Output Dir", value="outputs"),
+            gr.Number(label="Prompt Window (s, max 100)", value=100.0),
+        ],
+        outputs=gr.Textbox(label="Output JSON"),
+        title="Anticipatory Inpaint",
+        description="Inpaint a region using up to 100s of surrounding context.",
     )
 
 
