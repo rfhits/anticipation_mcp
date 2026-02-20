@@ -196,6 +196,20 @@ def continue_midi(
     output_dir: str,
     prompt_window_s: float,
 ) -> str:
+    """Continue an input MIDI by appending newly generated events.
+
+    Agent-facing usage notes:
+    - `midi_path`: local `.mid` file path.
+    - `continue_length_s`: continuation length in seconds (> 0).
+    - `n_samples`: number of independent outputs (>= 1).
+    - `output_dir`: directory for generated files (created automatically).
+    - `prompt_window_s`: max visible history window in seconds (> 0, capped at 100).
+
+    Returns:
+    - A newline-separated string of output paths.
+    - One file per sample:
+      `{output_dir}/{stem}_continue_{YYYYMMDD_HHMMSS}_{i}.mid`
+    """
     if not midi_path or not isinstance(midi_path, str):
         raise ValueError("midi_path must be a local file path string")
     if continue_length_s is None or continue_length_s <= 0:
@@ -254,6 +268,20 @@ def inpaint_midi(
     output_dir: str,
     prompt_window_s: float,
 ) -> str:
+    """Inpaint (regenerate) the region [start_s, end_s) of a MIDI file.
+
+    Agent-facing usage notes:
+    - `midi_path`: local `.mid` file path.
+    - `start_s`, `end_s`: inpaint interval in seconds, must satisfy `end_s > start_s`.
+    - `n_samples`: number of independent outputs (>= 1).
+    - `output_dir`: directory for generated files (created automatically).
+    - `prompt_window_s`: context window in seconds (> 0, capped at 100).
+
+    Returns:
+    - A JSON string: `[{"full": "...", "part": "..."}]` (one object per sample).
+    - `full`: complete MIDI where only the masked region is replaced.
+    - `part`: only the generated inpaint segment, rebased to start at time 0.
+    """
     if not midi_path or not isinstance(midi_path, str):
         raise ValueError("midi_path must be a local file path string")
     if start_s is None or end_s is None or float(end_s) <= float(start_s):
@@ -374,6 +402,28 @@ def accompany_midi(
     output_dir: str,
     prompt_window_s: float,
 ) -> str:
+    """Generate accompaniment aligned to a melody timeline.
+
+    Agent-facing usage notes:
+    - `melody_path`: local `.mid` melody file used as control.
+    - `accomp_history_path`: optional accompaniment history MIDI; when provided,
+      only events before `start_s` are used as historical context.
+    - `start_s`: cursor on melody timeline where accompaniment generation starts.
+    - `continue_length_s`: duration to generate from `start_s` (> 0).
+    - `n_samples`: number of independent outputs (>= 1).
+    - `output_dir`: directory for generated files (created automatically).
+    - `prompt_window_s`: context window in seconds (> 0, capped at 100).
+
+    Returns:
+    - A JSON string with one object per sample:
+      `{"full_accompaniment": "...", "part_accompaniment": "...", "merged": "..."}`
+    - `full_accompaniment`: accompaniment only (history + newly generated segment),
+      no melody track merged in.
+    - `part_accompaniment`: only the newly generated accompaniment segment for the
+      target interval.
+    - `merged`: melody + accompaniment merged together, where melody is included
+      from time 0 up to `start_s + continue_length_s`.
+    """
     if not melody_path or not isinstance(melody_path, str):
         raise ValueError("melody_path must be a local file path string")
     if start_s is None or float(start_s) < 0:
