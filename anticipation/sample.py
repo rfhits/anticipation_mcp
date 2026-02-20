@@ -6,7 +6,6 @@ import math
 
 import torch
 import torch.nn.functional as F
-
 from tqdm import tqdm
 
 from anticipation import ops
@@ -107,7 +106,17 @@ def add_token(model, z, tokens, top_p, current_time, debug=False):
     return new_token
 
 
-def generate(model, start_time, end_time, inputs=None, controls=None, top_p=1.0, debug=False, delta=DELTA*TIME_RESOLUTION):
+def generate(
+    model,
+    start_time,
+    end_time,
+    inputs=None,
+    controls=None,
+    top_p=1.0,
+    debug=False,
+    delta=DELTA * TIME_RESOLUTION,
+    progress=True,
+):
     if inputs is None:
         inputs = []
 
@@ -148,7 +157,7 @@ def generate(model, start_time, end_time, inputs=None, controls=None, top_p=1.0,
     if debug:
         print('Current time:', current_time)
 
-    with tqdm(range(end_time-start_time)) as progress:
+    with tqdm(range(end_time-start_time), disable=not progress) as progress:
         if controls:
             atime, adur, anote = controls[0:3]
             anticipated_tokens = controls[3:]
@@ -194,7 +203,17 @@ def generate(model, start_time, end_time, inputs=None, controls=None, top_p=1.0,
     return ops.sort(ops.unpad(events) + future)
 
 
-def generate_ar(model, start_time, end_time, inputs=None, controls=None, top_p=1.0, debug=False, delta=DELTA*TIME_RESOLUTION):
+def generate_ar(
+    model,
+    start_time,
+    end_time,
+    inputs=None,
+    controls=None,
+    top_p=1.0,
+    debug=False,
+    delta=DELTA * TIME_RESOLUTION,
+    progress=True,
+):
     if inputs is None:
         inputs = []
 
@@ -230,7 +249,7 @@ def generate_ar(model, start_time, end_time, inputs=None, controls=None, top_p=1
         print('Current time:', current_time)
 
     tokens = prompt
-    with tqdm(range(end_time-start_time)) as progress:
+    with tqdm(range(end_time-start_time), disable=not progress) as progress:
         if controls:
             atime, adur, anote = controls[0:3]
             anticipated_tokens = controls[3:]
